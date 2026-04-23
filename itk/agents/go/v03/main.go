@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,11 +35,31 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+func shouldHold(inst *pb.Instruction) bool {
+	if inst.GetReturnResponse() != nil && inst.GetReturnResponse().HoldTask {
+		return true
+	}
+	if inst.GetSteps() != nil {
+		for _, step := range inst.GetSteps().Instructions {
+			if shouldHold(step) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 type V03AgentExecutor struct {
+	cancels sync.Map
 }
 
 func (e *V03AgentExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
 	log.Info(ctx, "Executing task", "taskId", reqCtx.Message.ID)
+
+	ctx, cancel := context.WithCancel(ctx)
+	e.cancels.Store(reqCtx.TaskID, cancel)
+	defer e.cancels.Delete(reqCtx.TaskID)
+	defer cancel()
 
 	if reqCtx.StoredTask == nil {
 		if err := queue.Write(ctx, a2a.NewSubmittedTask(reqCtx, reqCtx.Message)); err != nil {
@@ -90,10 +111,47 @@ func (e *V03AgentExecutor) Execute(ctx context.Context, reqCtx *a2asrv.RequestCo
 
 	// 3. Return response
 	response := strings.Join(results, "\n")
-	msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: response})
-	event := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCompleted, msg)
-	event.Final = true
-	return queue.Write(ctx, event)
+	
+	if shouldHold(&instruction) {
+		log.Info(ctx, "Holding task as requested", "taskId", reqCtx.Message.ID)
+		
+		// First emitted event: the actual response
+		msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: response})
+		if err := queue.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, msg)); err != nil {
+			return err
+		}
+		time.Sleep(2 * time.Second)
+		
+		// Second emitted event: message with text "task-finnished"
+		log.Info(ctx, "Emitting task-finnished", "taskId", reqCtx.Message.ID)
+		finnishedMsg := a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: "task-finnished"})
+		if err := queue.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, finnishedMsg)); err != nil {
+			return err
+		}
+		time.Sleep(2 * time.Second)
+		
+		// Continue emitting "task-finnished" every 2 seconds
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ctx.Done():
+				log.Info(ctx, "Task cancelled, exiting hold loop", "taskId", reqCtx.Message.ID)
+				return nil
+			case <-ticker.C:
+				log.Info(ctx, "Emitting periodic status update", "taskId", reqCtx.Message.ID)
+				if err := queue.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateWorking, finnishedMsg)); err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		msg := a2a.NewMessageForTask(a2a.MessageRoleAgent, reqCtx, a2a.TextPart{Text: response})
+		event := a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCompleted, msg)
+		event.Final = true
+		return queue.Write(ctx, event)
+	}
 }
 
 func (e *V03AgentExecutor) handleInstruction(ctx context.Context, reqCtx *a2asrv.RequestContext, inst *pb.Instruction) ([]string, error) {
@@ -222,9 +280,13 @@ func boolPtr(b bool) *bool {
 	return &b
 }
 
-func (e *V03AgentExecutor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, _ eventqueue.Queue) error {
-	log.Info(ctx, "Cancel requested", "taskId", reqCtx.Message.ID)
-	return nil
+func (e *V03AgentExecutor) Cancel(ctx context.Context, reqCtx *a2asrv.RequestContext, queue eventqueue.Queue) error {
+	log.Info(ctx, "Cancel requested", "taskId", reqCtx.TaskID)
+	err := queue.Write(ctx, a2a.NewStatusUpdateEvent(reqCtx, a2a.TaskStateCanceled, nil))
+	if cancel, ok := e.cancels.Load(reqCtx.TaskID); ok {
+		cancel.(context.CancelFunc)()
+	}
+	return err
 }
 
 func wrapInstructionToRequest(inst *pb.Instruction) (*a2a.MessageSendParams, error) {
